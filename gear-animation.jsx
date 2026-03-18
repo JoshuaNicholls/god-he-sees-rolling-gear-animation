@@ -126,11 +126,14 @@ function App() {
   }, []);
 
   const toggle = () => {
-    if (!actxRef.current)
-      actxRef.current = new (window.AudioContext || window.webkitAudioContext)();
-    playingRef.current = !playingRef.current;
-    setPlaying(p => !p);
-  };
+  if (!actxRef.current)
+    actxRef.current = new (window.AudioContext || window.webkitAudioContext)();
+  // Wake the context synchronously before any sounds fire
+  if (actxRef.current.state === "suspended")
+    actxRef.current.resume();
+  playingRef.current = !playingRef.current;
+  setPlaying(p => !p);
+};
 
   const offset   = offsetRef.current;
   const rotation = rotRef.current;
