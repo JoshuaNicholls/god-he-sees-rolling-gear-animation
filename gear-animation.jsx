@@ -9,8 +9,7 @@ const CY = 110;
 const GROUND_Y = CY + R;
 const BPM = 150;
 const SPEED = BPM * 4 * PX_PER_SIXTEENTH / 60;
-
-const PX_PER_BEAT = 4 * PX_PER_SIXTEENTH; // 40px
+const PX_PER_BEAT = 4 * PX_PER_SIXTEENTH;
 
 const baseNotchAngles = [];
 let acc = 0;
@@ -20,8 +19,6 @@ for (const gap of PATTERN) {
 }
 const hitPhases = baseNotchAngles.map(a => Math.PI / 2 - a);
 
-// Beat 0=1, 1=2, 2=3, 3=4 → High Low Med Low
-// frequency of noise filter per beat
 const BEAT_FREQ = [5000, 800, 2500, 800];
 const BEAT_GAIN = [2.5, 1.5, 2.0, 1.5];
 
@@ -50,13 +47,29 @@ function playNotchBeep(actx) {
   const now = actx.currentTime;
   const osc = actx.createOscillator();
   osc.type = "sine";
-  osc.frequency.value = 233.08; // Bb3
+  osc.frequency.value = 233.08;
   const g = actx.createGain();
   g.gain.setValueAtTime(0.6, now);
   g.gain.exponentialRampToValueAtTime(0.001, now + 0.08);
   osc.connect(g); g.connect(actx.destination);
-  osc.start(now);
-  osc.stop(now + 0.08);
+  osc.start(now); osc.stop(now + 0.08);
+}
+
+let dustId = 0;
+function spawnDust(dustRef) {
+  const count = 5 + Math.floor(Math.random() * 4);
+  for (let i = 0; i < count; i++) {
+    dustRef.current.push({
+      id: dustId++,
+      x: CX,
+      y: GROUND_Y,
+      vx: -(1.5 + Math.random() * 3.5),  // leftward
+      vy: -(Math.random() * 2),            // slight upward scatter
+      life: 1.0,
+      decay: 0.04 + Math.random() * 0.03,
+      r: 1.5 + Math.random() * 2,
+    });
+  }
 }
 
 function App() {
@@ -66,7 +79,7 @@ function App() {
   const playingRef              = useRef(false);
   const lastTsRef               = useRef(null);
   const actxRef                 = useRef(null);
-  const prevBeatRef             = useRef(-1);
+  const dustRef                 = useRef([]);
   const [, forceRender]         = useState(0);
 
   useEffect(() => {
@@ -85,22 +98,18 @@ function App() {
           const newOffset = offsetRef.current;
 
           if (actxRef.current) {
-            // Notch hits
             for (let i = 0; i < hitPhases.length; i++) {
               const ph = hitPhases[i];
               if (Math.floor((prevRot - ph) / (2 * Math.PI)) !==
                   Math.floor((newRot  - ph) / (2 * Math.PI))) {
                 playNotchBeep(actxRef.current);
+                spawnDust(dustRef);
               }
             }
-
-            // Beat metronome — fires every 4 sixteenth notes
             const prevBeat = Math.floor(prevOffset / PX_PER_BEAT);
             const newBeat  = Math.floor(newOffset  / PX_PER_BEAT);
             if (newBeat !== prevBeat) {
-              const beatInBar = ((newBeat % 4) + 4) % 4;
-              playMetronome(actxRef.current, beatInBar);
-              prevBeatRef.current = newBeat;
+              playMetronome(actxRef.current, ((newBeat % 4) + 4) % 4);
             }
           }
         }
@@ -108,6 +117,12 @@ function App() {
       } else {
         lastTsRef.current = null;
       }
+
+      // Update dust particles
+      dustRef.current = dustRef.current
+        .map(p => ({ ...p, x: p.x + p.vx, y: p.y + p.vy, vy: p.vy + 0.08, life: p.life - p.decay }))
+        .filter(p => p.life > 0);
+
       forceRender(n => n + 1);
       rafId = requestAnimationFrame(tick);
     };
@@ -125,7 +140,6 @@ function App() {
   const offset   = offsetRef.current;
   const rotation = rotRef.current;
 
-  // Ground ticks
   const ticks = [];
   const firstTick = Math.floor((offset - CX) / PX_PER_SIXTEENTH);
   const lastTick  = Math.ceil((offset + (300 - CX)) / PX_PER_SIXTEENTH);
@@ -147,7 +161,7 @@ function App() {
 
   return (
     <div style={{ background: "#111", display: "inline-block", padding: 10 }}>
-      <svg width="300" height={Math.ceil(GROUND_Y) + 30} style={{ display: "block" }}>
+      <svg width="300" height={Math.ceil(GROUND_Y) + 40} style={{ display: "block" }}>
         {ticks}
         <line x1="0" y1={GROUND_Y} x2="300" y2={GROUND_Y} stroke="#888" strokeWidth="2" />
         <circle cx={CX} cy={CY} r={R} fill="none" stroke="#444" strokeWidth="2" />
@@ -161,6 +175,15 @@ function App() {
           />
         ))}
         <circle cx={CX} cy={GROUND_Y} r="4" fill="red" />
+
+        {/* Dust particles */}
+        {dustRef.current.map(p => (
+          <circle
+            key={p.id}
+            cx={p.x} cy={p.y} r={p.r}
+            fill={`rgba(210,140,50,${p.life.toFixed(2)})`}
+          />
+        ))}
       </svg>
       <button onClick={toggle}
         style={{ marginTop: 8, width: "100%", padding: "6px 0",
