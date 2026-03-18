@@ -61,10 +61,9 @@ function spawnDust(dustRef) {
   for (let i = 0; i < count; i++) {
     dustRef.current.push({
       id: dustId++,
-      x: CX,
-      y: GROUND_Y,
-      vx: -(1.5 + Math.random() * 3.5),  // leftward
-      vy: -(Math.random() * 2),            // slight upward scatter
+      x: CX, y: GROUND_Y,
+      vx: -(1.5 + Math.random() * 3.5),
+      vy: -(Math.random() * 2),
       life: 1.0,
       decay: 0.04 + Math.random() * 0.03,
       r: 1.5 + Math.random() * 2,
@@ -73,14 +72,14 @@ function spawnDust(dustRef) {
 }
 
 function App() {
-  const [playing, setPlaying]   = useState(false);
-  const offsetRef               = useRef(0);
-  const rotRef                  = useRef(0);
-  const playingRef              = useRef(false);
-  const lastTsRef               = useRef(null);
-  const actxRef                 = useRef(null);
-  const dustRef                 = useRef([]);
-  const [, forceRender]         = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const offsetRef  = useRef(0);
+  const rotRef     = useRef(0);
+  const playingRef = useRef(false);
+  const lastTsRef  = useRef(null);
+  const actxRef    = useRef(null);
+  const dustRef    = useRef([]);
+  const [, forceRender] = useState(0);
 
   useEffect(() => {
     let rafId;
@@ -90,10 +89,8 @@ function App() {
           const dt = Math.min((ts - lastTsRef.current) / 1000, 0.05);
           const prevRot    = rotRef.current;
           const prevOffset = offsetRef.current;
-
           offsetRef.current += SPEED * dt;
           rotRef.current     = offsetRef.current / R;
-
           const newRot    = rotRef.current;
           const newOffset = offsetRef.current;
 
@@ -108,9 +105,8 @@ function App() {
             }
             const prevBeat = Math.floor(prevOffset / PX_PER_BEAT);
             const newBeat  = Math.floor(newOffset  / PX_PER_BEAT);
-            if (newBeat !== prevBeat) {
+            if (newBeat !== prevBeat)
               playMetronome(actxRef.current, ((newBeat % 4) + 4) % 4);
-            }
           }
         }
         lastTsRef.current = ts;
@@ -118,7 +114,6 @@ function App() {
         lastTsRef.current = null;
       }
 
-      // Update dust particles
       dustRef.current = dustRef.current
         .map(p => ({ ...p, x: p.x + p.vx, y: p.y + p.vy, vy: p.vy + 0.08, life: p.life - p.decay }))
         .filter(p => p.life > 0);
@@ -147,8 +142,9 @@ function App() {
     const x = n * PX_PER_SIXTEENTH - offset + CX;
     const isMeasure = ((n % 16) + 16) % 16 === 0;
     const isBeat    = ((n % 4)  + 4)  % 4  === 0;
-    const h     = isMeasure ? 18 : isBeat ? 12 : 6;
-    const color = isMeasure ? "white" : isBeat ? "#aaa" : "#555";
+    const h     = isMeasure ? 22 : isBeat ? 14 : 7;
+    // Metallic grey tones for ground ticks
+    const color = isMeasure ? "#c8c8c8" : isBeat ? "#7a8a8a" : "#3a4444";
     ticks.push(
       <line key={n}
         x1={x} y1={GROUND_Y} x2={x} y2={GROUND_Y + h}
@@ -160,35 +156,60 @@ function App() {
   const notchAngles = baseNotchAngles.map(a => a + rotation);
 
   return (
-    <div style={{ background: "#111", display: "inline-block", padding: 10 }}>
+    <div style={{ background: "#1a1210", display: "inline-block", padding: 10 }}>
       <svg width="300" height={Math.ceil(GROUND_Y) + 40} style={{ display: "block" }}>
+
         {ticks}
-        <line x1="0" y1={GROUND_Y} x2="300" y2={GROUND_Y} stroke="#888" strokeWidth="2" />
-        <circle cx={CX} cy={CY} r={R} fill="none" stroke="#444" strokeWidth="2" />
+
+        {/* Ground — metallic steel plate look */}
+        <line x1="0" y1={GROUND_Y} x2="300" y2={GROUND_Y}
+              stroke="#a0aaa8" strokeWidth="2.5" />
+        {/* Subtle ground sheen line */}
+        <line x1="0" y1={GROUND_Y + 3} x2="300" y2={GROUND_Y + 3}
+              stroke="#4a5555" strokeWidth="1" />
+
+        {/* Wheel fill — dark rusty iron */}
+        <circle cx={CX} cy={CY} r={R} fill="#2a1a0e" />
+        {/* Wheel rim — oxidised orange-brown */}
+        <circle cx={CX} cy={CY} r={R} fill="none"
+                stroke="#8b4a1a" strokeWidth="3" />
+        {/* Rim highlight */}
+        <circle cx={CX} cy={CY} r={R - 1.5} fill="none"
+                stroke="#c4622a" strokeWidth="1" opacity="0.4" />
+
+        {/* Notch spokes — burnt orange */}
         {notchAngles.map((a, i) => (
           <line key={i}
-            x1={CX + Math.cos(a) * R}
-            y1={CY + Math.sin(a) * R}
+            x1={CX + Math.cos(a) * (R - 4)}
+            y1={CY + Math.sin(a) * (R - 4)}
             x2={CX + Math.cos(a) * (R + 10)}
             y2={CY + Math.sin(a) * (R + 10)}
-            stroke="orange" strokeWidth="2"
+            stroke="#d4581a" strokeWidth="2.5"
           />
         ))}
-        <circle cx={CX} cy={GROUND_Y} r="4" fill="red" />
 
-        {/* Dust particles */}
+        {/* Hub */}
+        <circle cx={CX} cy={CY} r={6} fill="#3a2010" />
+        <circle cx={CX} cy={CY} r={6} fill="none"
+                stroke="#7a3a18" strokeWidth="1.5" />
+
+        {/* Contact point — hot orange */}
+        <circle cx={CX} cy={GROUND_Y} r="4" fill="#ff6a1a" />
+        <circle cx={CX} cy={GROUND_Y} r="4" fill="none"
+                stroke="#ff9955" strokeWidth="1" />
+
+        {/* Dust */}
         {dustRef.current.map(p => (
-          <circle
-            key={p.id}
-            cx={p.x} cy={p.y} r={p.r}
-            fill={`rgba(210,140,50,${p.life.toFixed(2)})`}
-          />
+          <circle key={p.id} cx={p.x} cy={p.y} r={p.r}
+            fill={`rgba(190,120,40,${p.life.toFixed(2)})`} />
         ))}
       </svg>
+
       <button onClick={toggle}
         style={{ marginTop: 8, width: "100%", padding: "6px 0",
-                 background: "#222", color: playing ? "#f55" : "#5f5",
-                 border: "1px solid #444", cursor: "pointer", fontFamily: "monospace" }}>
+                 background: "#1e0e06", color: playing ? "#ff6622" : "#88cc44",
+                 border: `1px solid ${playing ? "#662200" : "#336611"}`,
+                 cursor: "pointer", fontFamily: "monospace", letterSpacing: "0.1em" }}>
         {playing ? "⏸ PAUSE" : "▶ PLAY"}
       </button>
     </div>
