@@ -1,0 +1,778 @@
+import { useState, useEffect, useRef, useCallback } from "react";
+
+// ─── Level 1 definition ───────────────────────────────────────────────────────
+// Each block is an array of sixteenth-note subdivisions.
+// Sum / 2 = eighths = the key the player must press.
+// (4,4)=8/16=4/8 → key 4   (4,2)=6/16=3/8 → key 3   (4,6)=10/16=5/8 → key 5
+const LEVEL_1 = {
+  name: "MARROW — LEVEL I",
+  bpm: 148,
+  blocks: [
+    [4,4],[4,2],[4,4],[4,2],[4,4],[4,6],[4,2],[4,4],
+    [4,4],[4,2],[4,4],[4,2],[4,4],[4,6],[4,2],[4,4],[4,4],
+  ],
+};
+
+// ─── Layout constants ─────────────────────────────────────────────────────────
+const W = 860;
+const H = 440;
+const BELT_Y = 280;          // y of belt top surface
+const BELT_H = 14;           // belt thickness
+const BLOCK_H = 80;          // block height above belt
+const SIXTEENTH_W = 30;      // px per sixteenth note (wider = faster scroll, BPM stays aligned)
+const MALLET_X = 120;        // fulcrum x
+const MALLET_FULCRUM_Y = BELT_Y + BELT_H + 55; // fulcrum ~55px below belt bottom
+const HANDLE_HALF = 48;      // half-handle: head reaches up to ~7px below belt
+const HEAD_W = 32;
+const HEAD_H = 16;
+const LEVER_BASE_Y = BELT_Y + BELT_H; // levers start here, go downward
+const LEVER_PX_PER_16TH = 14; // pixels per sixteenth note of lever height
+
+// Scroll speed: we want blocks to move in px/frame.
+// At 148 BPM, one sixteenth = (60/148/4) seconds = 0.101s
+// At 60fps that's ~6.08 frames per sixteenth.
+// We want SIXTEENTH_W px to travel in that many frames.
+const FRAMES_PER_16TH = (60 / 148 / 4) * 60; // ≈ 6.08
+const SCROLL_PX_PER_FRAME = SIXTEENTH_W / FRAMES_PER_16TH; // ≈ 3.62
+
+// Window for player input: from when the ghost appears until the leading
+// edge of the ghost slot would reach the right edge of the screen.
+// We give the player until the ghost slot is ~80px from screen right.
+const PLACEMENT_BUFFER_PX = 80;
+
+// ─── Audio ────────────────────────────────────────────────────────────────────
+function getAudioCtx(ref) {
+  if (!ref.current) ref.current = new (window.AudioContext || window.webkitAudioContext)();
+  return ref.current;
+}
+
+function playHit(actx, leverLen) {
+  if (!actx) return;
+  const freq = 80 + leverLen * 12;
+  const osc = actx.createOscillator();
+  const gain = actx.createGain();
+  const dist = actx.createWaveShaper();
+  const curve = new Float32Array(256);
+  for (let i = 0; i < 256; i++) curve[i] = ((i / 128) - 1) * 0.6;
+  dist.curve = curve;
+  osc.connect(dist); dist.connect(gain); gain.connect(actx.destination);
+  osc.type = "sawtooth";
+  osc.frequency.setValueAtTime(freq, actx.currentTime);
+  osc.frequency.exponentialRampToValueAtTime(freq * 0.25, actx.currentTime + 0.18);
+  gain.gain.setValueAtTime(0.4, actx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + 0.22);
+  osc.start(); osc.stop(actx.currentTime + 0.25);
+}
+
+function playMiss(actx) {
+  if (!actx) return;
+  [0, 130, 270].forEach((delay, i) => {
+    setTimeout(() => {
+      const osc = actx.createOscillator();
+      const gain = actx.createGain();
+      osc.connect(gain); gain.connect(actx.destination);
+      osc.type = "sawtooth";
+      osc.frequency.setValueAtTime(52 + i * 6, actx.currentTime);
+      osc.frequency.exponentialRampToValueAtTime(28, actx.currentTime + 0.28);
+      gain.gain.setValueAtTime(0.55, actx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + 0.32);
+      osc.start(); osc.stop(actx.currentTime + 0.35);
+    }, delay);
+  });
+}
+
+function playPlace(actx) {
+  if (!actx) return;
+  const osc = actx.createOscillator();
+  const gain = actx.createGain();
+  osc.connect(gain); gain.connect(actx.destination);
+  osc.type = "square";
+  osc.frequency.setValueAtTime(380, actx.currentTime);
+  osc.frequency.exponentialRampToValueAtTime(200, actx.currentTime + 0.06);
+  gain.gain.setValueAtTime(0.12, actx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + 0.09);
+  osc.start(); osc.stop(actx.currentTime + 0.1);
+}
+
+// ─── Sparks ───────────────────────────────────────────────────────────────────
+function makeSparks(x, y, n = 16) {
+  return Array.from({ length: n }, () => ({
+    id: Math.random(),
+    x, y,
+    vx: (Math.random() - 0.5) * 9,
+    vy: Math.random() * 5 + 1,   // downward (below belt)
+    life: 1,
+    size: Math.random() * 3 + 1,
+    color: Math.random() > 0.45 ? "#FF8C00" : "#FFFFFF",
+  }));
+}
+
+// ─── Block factory ────────────────────────────────────────────────────────────
+let _id = 0;
+function makeBlock(subdivs, x) {
+  const totalSixteenths = subdivs.reduce((a, b) => a + b, 0);
+  const width = totalSixteenths * SIXTEENTH_W;
+  const key = totalSixteenths / 2; // eighths = key to press
+  return { id: _id++, subdivs, totalSixteenths, width, x, key, struck: [] };
+}
+
+// ─── Main component ───────────────────────────────────────────────────────────
+export default function MarrowGame() {
+  const canvasRef = useRef(null);
+  const audioRef = useRef(null);
+  const rafRef = useRef(null);
+
+  // All mutable game state lives here to avoid stale closure issues
+  const gs = useRef({
+    phase: "idle",       // idle | playing | gameover | win
+    blocks: [],          // placed blocks scrolling on belt
+    seqIdx: 0,           // which block in LEVEL_1.blocks we need next
+    score: 0,
+    highScore: 0,
+    frameCount: 0,
+    // Ghost
+    ghostX: W + 10,      // x of incoming ghost (starts off right edge)
+    ghostSubdivs: null,  // subdivs of needed block
+    ghostWidth: 0,
+    ghostDropY: -120,    // animated drop-in y offset (starts above)
+    ghostVisible: false,
+    ghostLanded: false,  // true once it has settled
+    windowOpen: false,
+    windowDeadlineX: 0,  // when ghostX reaches this, window closes
+    // Mallet
+    malletAngle: 0,       // radians; 0 = vertical up
+    malletVelocity: 0,
+    malletRestAngle: 0,
+    // FX
+    sparks: [],
+    shakeFrames: 0,
+    shakeDecay: 0,
+    gameOverReason: "",
+    // Belt scroll offset for texture
+    beltOffset: 0,
+  });
+
+  const [uiPhase, setUiPhase] = useState("idle");
+  const [score, setScore] = useState(0);
+  const [highScore, setHighScore] = useState(0);
+  const [seqIdx, setSeqIdx] = useState(0);
+  const [gameOverReason, setGameOverReason] = useState("");
+
+  // ── Sync UI from gs ──
+  const syncUI = useCallback(() => {
+    const s = gs.current;
+    setUiPhase(s.phase);
+    setScore(s.score);
+    setHighScore(s.highScore);
+    setSeqIdx(s.seqIdx);
+    setGameOverReason(s.gameOverReason);
+  }, []);
+
+  // ── Spawn next ghost ──
+  const spawnGhost = useCallback((s) => {
+    if (s.seqIdx >= LEVEL_1.blocks.length) return;
+    const subdivs = LEVEL_1.blocks[s.seqIdx];
+    const totalSixteenths = subdivs.reduce((a, b) => a + b, 0);
+    const width = totalSixteenths * SIXTEENTH_W;
+    // Ghost appears just off right edge
+    s.ghostX = W + 10;
+    s.ghostSubdivs = subdivs;
+    s.ghostWidth = width;
+    s.ghostDropY = -120;
+    s.ghostVisible = true;
+    s.ghostLanded = false;
+    s.windowOpen = true;
+    // Deadline: game over the instant the ghost's left edge reaches the mallet
+    s.windowDeadlineX = MALLET_X;
+  }, []);
+
+  // ── Trigger game over ──
+  const triggerGameOver = useCallback((s, reason) => {
+    s.phase = "gameover";
+    s.gameOverReason = reason;
+    if (s.score > s.highScore) s.highScore = s.score;
+    s.shakeFrames = 90;   // counts down to 0
+    s.shakeDecay = 0.94;  // slow decay = shakes for longer
+    s.shakeMag = 28;      // big initial magnitude
+    const actx = audioRef.current;
+    playMiss(actx);
+    syncUI();
+  }, [syncUI]);
+
+  // ── Start game ──
+  const startGame = useCallback(() => {
+    if (!audioRef.current) audioRef.current = new (window.AudioContext || window.webkitAudioContext)();
+    const s = gs.current;
+    s.phase = "playing";
+    s.blocks = [];
+    s.seqIdx = 0;
+    s.score = 0;
+    s.frameCount = 0;
+    s.sparks = [];
+    s.shakeFrames = 0;
+    s.shakeMag = 0;
+    s.malletAngle = 0;
+    s.malletVelocity = 0;
+    s.beltOffset = 0;
+    s.ghostVisible = false;
+    s.ghostLanded = false;
+    s.windowOpen = false;
+    _id = 0;
+    spawnGhost(s);
+    syncUI();
+  }, [spawnGhost, syncUI]);
+
+  // ── Key handler ──
+  useEffect(() => {
+    const onKey = (e) => {
+      const s = gs.current;
+      if (e.key === "Enter") {
+        if (s.phase === "idle" || s.phase === "gameover" || s.phase === "win") startGame();
+        return;
+      }
+      if (s.phase !== "playing") return;
+      const k = parseInt(e.key);
+      if (k !== 3 && k !== 4 && k !== 5) return;
+      e.preventDefault();
+
+      if (!s.windowOpen || !s.ghostSubdivs) return;
+
+      const needed = s.ghostSubdivs.reduce((a, b) => a + b, 0) / 2;
+      if (k !== needed) {
+        triggerGameOver(s, `WRONG — needed ${needed}, pressed ${k}`);
+        return;
+      }
+
+      // Valid placement
+      const actx = audioRef.current;
+      playPlace(actx);
+
+      // Place block at the current ghost x position
+      const block = makeBlock(s.ghostSubdivs, s.ghostX);
+      s.blocks.push(block);
+      s.score += needed * 10;
+      s.seqIdx++;
+      s.ghostVisible = false;
+      s.ghostLanded = false;
+      s.windowOpen = false;
+      s.ghostSubdivs = null;
+
+      if (s.seqIdx >= LEVEL_1.blocks.length) {
+        // All blocks placed — wait for them to scroll through then win
+        // We'll check in the loop when all blocks are off screen
+        s.phase = "winning";
+        syncUI();
+        return;
+      }
+
+      // Spawn next ghost after a short delay
+      setTimeout(() => {
+        if (gs.current.phase === "playing") {
+          spawnGhost(gs.current);
+          syncUI();
+        }
+      }, 500);
+      syncUI();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [startGame, triggerGameOver, spawnGhost, syncUI]);
+
+  // ── Draw helpers ──
+  function drawBelt(ctx, beltOffset) {
+    const bTop = BELT_Y;
+    const bBot = BELT_Y + BELT_H;
+    // Belt body
+    const bg = ctx.createLinearGradient(0, bTop, 0, bBot);
+    bg.addColorStop(0, "#3a3a40");
+    bg.addColorStop(0.5, "#222228");
+    bg.addColorStop(1, "#3a3a40");
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, bTop, W, BELT_H);
+    // Scrolling ridges — scroll RIGHT (belt surface moves right under blocks moving left)
+    // Belt moves opposite to blocks
+    const ridgeSpacing = 28;
+    ctx.strokeStyle = "rgba(90,90,100,0.55)";
+    ctx.lineWidth = 1;
+    // beltOffset increases over time
+    for (let x = (beltOffset % ridgeSpacing) - ridgeSpacing; x < W + ridgeSpacing; x += ridgeSpacing) {
+      ctx.beginPath(); ctx.moveTo(x, bTop); ctx.lineTo(x, bBot); ctx.stroke();
+    }
+    // Rails
+    ctx.strokeStyle = "#666672";
+    ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.moveTo(0, bTop); ctx.lineTo(W, bTop); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0, bBot); ctx.lineTo(W, bBot); ctx.stroke();
+    // Mallet strike zone glow
+    const zg = ctx.createRadialGradient(MALLET_X, bTop, 0, MALLET_X, bTop, 60);
+    zg.addColorStop(0, "rgba(255,140,0,0.18)");
+    zg.addColorStop(1, "rgba(255,140,0,0)");
+    ctx.fillStyle = zg;
+    ctx.fillRect(MALLET_X - 60, bTop - 8, 120, BELT_H + 16);
+    // Dashed strike line
+    ctx.setLineDash([4, 5]);
+    ctx.strokeStyle = "rgba(255,140,0,0.45)";
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(MALLET_X, bTop - 14); ctx.lineTo(MALLET_X, bBot + 14); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  function drawBlock(ctx, block, isGhost, ghostDropY) {
+    const bTop = BELT_Y;
+    const blockTop = bTop - BLOCK_H;
+
+    let drawX = block.x;
+    let alpha = 1;
+    let dropOffset = 0;
+
+    if (isGhost) {
+      drawX = block.x; // ghostX passed in as block.x
+      alpha = 0.0; // we draw ghost separately below
+      dropOffset = ghostDropY; // used for drop animation
+    }
+
+    const bw = block.width;
+
+    // Ghost: dashed outline dropping in
+    if (isGhost) {
+      const landed = ghostDropY >= 0;
+      const dy = Math.min(ghostDropY, 0); // negative = above belt, 0 = landed
+      const ghostTop = blockTop + dy;
+      ctx.save();
+      ctx.globalAlpha = 0.55 + (landed ? 0 : 0);
+      ctx.strokeStyle = "#FF8C00";
+      ctx.lineWidth = 2;
+      ctx.setLineDash([7, 5]);
+      ctx.strokeRect(drawX, ghostTop, bw, BLOCK_H);
+      ctx.setLineDash([]);
+      // Label
+      ctx.fillStyle = "rgba(255,140,0,0.7)";
+      ctx.font = "bold 12px 'Courier New', monospace";
+      ctx.textAlign = "center";
+      ctx.fillText(`PRESS [ ${block.key} ]`, drawX + bw / 2, ghostTop - 8);
+      ctx.restore();
+      return;
+    }
+
+    // Real block body
+    const bg = ctx.createLinearGradient(drawX, blockTop, drawX, bTop);
+    bg.addColorStop(0, "#505060");
+    bg.addColorStop(0.4, "#3a3a48");
+    bg.addColorStop(1, "#282830");
+    ctx.fillStyle = bg;
+    ctx.fillRect(drawX, blockTop, bw, BLOCK_H);
+
+    // Border
+    ctx.strokeStyle = "#8888aa";
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(drawX + 0.75, blockTop + 0.75, bw - 1.5, BLOCK_H - 1.5);
+
+    // Subdivision screws + levers
+    let cumX = 0;
+    block.subdivs.forEach((seg, i) => {
+      const sx = drawX + cumX; // left edge of this segment
+      const leverX = sx; // lever at START of each segment
+      const leverH = seg * LEVER_PX_PER_16TH;
+
+      // Screw at leverX (on the block face, at belt level)
+      const screwY = bTop - 4;
+      ctx.fillStyle = "#aaaacc";
+      ctx.beginPath(); ctx.arc(leverX, screwY, 4.5, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = "#555566"; ctx.lineWidth = 1; ctx.stroke();
+      // Screw slot
+      ctx.strokeStyle = "#666677"; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(leverX - 2.5, screwY); ctx.lineTo(leverX + 2.5, screwY); ctx.stroke();
+
+      // Lever — hangs below belt
+      const leverTop = LEVER_BASE_Y;
+      const leverBot = leverTop + leverH;
+      ctx.strokeStyle = "#ccccdd";
+      ctx.lineWidth = 2.5;
+      ctx.beginPath(); ctx.moveTo(leverX, leverTop); ctx.lineTo(leverX, leverBot); ctx.stroke();
+      // Lever tip bulb
+      ctx.fillStyle = "#ddddee";
+      ctx.beginPath(); ctx.arc(leverX, leverBot, 4, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = "#777788"; ctx.lineWidth = 1; ctx.stroke();
+
+      // Segment divider line on block (skip last)
+      if (i < block.subdivs.length - 1) {
+        ctx.strokeStyle = "rgba(150,150,170,0.35)";
+        ctx.lineWidth = 1;
+        ctx.setLineDash([3, 3]);
+        ctx.beginPath(); ctx.moveTo(leverX, blockTop + 4); ctx.lineTo(leverX, bTop - 8); ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
+      cumX += seg * SIXTEENTH_W;
+    });
+
+    // Block size label
+    ctx.fillStyle = "rgba(200,200,220,0.5)";
+    ctx.font = "10px 'Courier New', monospace";
+    ctx.textAlign = "center";
+    ctx.fillText(`${block.key}/8`, drawX + bw / 2, blockTop + 14);
+  }
+
+  function drawMallet(ctx, angle) {
+    ctx.save();
+    ctx.translate(MALLET_X, MALLET_FULCRUM_Y);
+    ctx.rotate(angle);
+
+    // Wall nail / fulcrum
+    ctx.restore();
+    // Draw fulcrum pin on wall first (behind mallet)
+    ctx.save();
+    ctx.fillStyle = "#888899";
+    ctx.beginPath(); ctx.arc(MALLET_X, MALLET_FULCRUM_Y, 7, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = "#aaaacc"; ctx.lineWidth = 1.5; ctx.stroke();
+
+    // Mallet drawn rotated around fulcrum
+    ctx.translate(MALLET_X, MALLET_FULCRUM_Y);
+    ctx.rotate(angle);
+
+    // Handle (HANDLE_HALF up = toward head, HANDLE_HALF down = tail)
+    const hg = ctx.createLinearGradient(-6, -HANDLE_HALF, 6, HANDLE_HALF);
+    hg.addColorStop(0, "#555566");
+    hg.addColorStop(0.5, "#333344");
+    hg.addColorStop(1, "#444455");
+    ctx.fillStyle = hg;
+    ctx.fillRect(-5, -HANDLE_HALF, 10, HANDLE_HALF * 2);
+    ctx.strokeStyle = "#666677"; ctx.lineWidth = 1; ctx.strokeRect(-5, -HANDLE_HALF, 10, HANDLE_HALF * 2);
+
+    // Head (at top of handle, HANDLE_HALF upward)
+    const headY = -HANDLE_HALF - HEAD_H;
+    const hd = ctx.createLinearGradient(-HEAD_W / 2, headY, HEAD_W / 2, headY + HEAD_H);
+    hd.addColorStop(0, "#999aaa");
+    hd.addColorStop(0.5, "#c0c0d0");
+    hd.addColorStop(1, "#777788");
+    ctx.fillStyle = hd;
+    ctx.fillRect(-HEAD_W / 2, headY, HEAD_W, HEAD_H);
+    ctx.strokeStyle = "#aaaacc"; ctx.lineWidth = 2; ctx.strokeRect(-HEAD_W / 2, headY, HEAD_W, HEAD_H);
+
+    // Strike face highlight
+    ctx.fillStyle = "rgba(200,200,220,0.3)";
+    ctx.fillRect(-HEAD_W / 2, headY, HEAD_W, 4);
+
+    ctx.restore();
+  }
+
+  // ── Game loop ──
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+
+    function loop() {
+      const s = gs.current;
+      s.frameCount++;
+
+      // ── UPDATE ──
+      if (s.phase === "playing" || s.phase === "winning") {
+        // Scroll blocks left
+        s.blocks.forEach(b => { b.x -= SCROLL_PX_PER_FRAME; });
+        s.blocks = s.blocks.filter(b => b.x + b.width > -60);
+
+        // Belt texture offset (moves LEFT = same direction as blocks)
+        s.beltOffset -= SCROLL_PX_PER_FRAME;
+
+        // Ghost scroll + drop-in animation
+        if (s.ghostVisible) {
+          s.ghostX -= SCROLL_PX_PER_FRAME;
+          // Drop-in: ghostDropY goes from -120 to 0
+          if (s.ghostDropY < 0) {
+            s.ghostDropY = Math.min(0, s.ghostDropY + 8);
+          } else {
+            s.ghostLanded = true;
+          }
+          // Check deadline
+          if (s.windowOpen && s.ghostX < s.windowDeadlineX) {
+            triggerGameOver(s, "TOO SLOW — window expired");
+          }
+        }
+
+        // Mallet physics: spring return
+        const stiffness = 0.18;
+        const damping = 0.82;
+        s.malletVelocity += -stiffness * (s.malletAngle - s.malletRestAngle);
+        s.malletVelocity *= damping;
+        s.malletAngle += s.malletVelocity;
+        // Idle sway when at rest
+        if (Math.abs(s.malletAngle) < 0.01 && Math.abs(s.malletVelocity) < 0.001) {
+          s.malletAngle = Math.sin(s.frameCount * 0.025) * 0.03;
+        }
+
+        // Lever collision with mallet
+        // Levers hang downward from LEVER_BASE_Y. The mallet head is just below the belt.
+        // Collision fires when a lever's x position crosses MALLET_X.
+        s.blocks.forEach(block => {
+          let cumSixteenths = 0;
+          block.subdivs.forEach((seg, i) => {
+            if (block.struck[i]) { cumSixteenths += seg; return; }
+            const leverX = block.x + cumSixteenths * SIXTEENTH_W;
+
+            // Fire when lever sweeps through mallet x — within one frame's travel
+            if (leverX <= MALLET_X + HEAD_W / 2 && leverX >= MALLET_X - HEAD_W / 2 - SCROLL_PX_PER_FRAME) {
+              // Strike!
+              block.struck[i] = true;
+              s.malletVelocity += 0.25 + seg * 0.03;
+              const strikeY = MALLET_FULCRUM_Y - HANDLE_HALF - HEAD_H / 2;
+              s.sparks.push(...makeSparks(MALLET_X, strikeY));
+              s.shakeFrames = 12;
+              s.shakeDecay = 0.78;
+              s.shakeMag = 5;
+              s.score += seg * 2;
+              playHit(audioRef.current, seg);
+              syncUI();
+            }
+            cumSixteenths += seg;
+          });
+        });
+
+        // Sparks
+        s.sparks = s.sparks
+          .map(sp => ({ ...sp, x: sp.x + sp.vx, y: sp.y + sp.vy, vy: sp.vy + 0.35, life: sp.life - 0.04 }))
+          .filter(sp => sp.life > 0);
+
+        // Win condition: winning phase + all blocks off screen
+        if (s.phase === "winning" && s.blocks.every(b => b.x + b.width < 0)) {
+          s.phase = "win";
+          if (s.score > s.highScore) s.highScore = s.score;
+          syncUI();
+        }
+      }
+
+      // Shake decay — runs every frame regardless of phase so gameover shake finishes
+      if (s.shakeFrames > 0) {
+        s.shakeFrames--;
+        s.shakeMag *= s.shakeDecay;
+      }
+
+      // ── DRAW ──
+      // Screen shake
+      let shakeX = 0, shakeY = 0;
+      if (s.shakeFrames > 0) {
+        shakeX = (Math.random() - 0.5) * s.shakeMag;
+        shakeY = (Math.random() - 0.5) * s.shakeMag;
+      }
+      ctx.save();
+      ctx.translate(shakeX, shakeY);
+
+      // Background
+      const bg = ctx.createLinearGradient(0, 0, 0, H);
+      bg.addColorStop(0, "#080810");
+      bg.addColorStop(1, "#0e0e18");
+      ctx.fillStyle = bg;
+      ctx.fillRect(-10, -10, W + 20, H + 20);
+
+      // Grid
+      ctx.strokeStyle = "rgba(255,140,0,0.035)";
+      ctx.lineWidth = 1;
+      for (let x = 0; x < W; x += 44) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke(); }
+      for (let y = 0; y < H; y += 44) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+
+      // ── Belt (drawn before blocks so blocks appear on top) ──
+      drawBelt(ctx, s.beltOffset);
+
+      // ── Mallet (drawn before levers so levers appear in front) ──
+      drawMallet(ctx, s.malletAngle);
+
+      // ── Blocks ──
+      s.blocks.forEach(b => drawBlock(ctx, b, false, 0));
+
+      // ── Ghost ──
+      if (s.ghostVisible && s.ghostSubdivs) {
+        const totalSixteenths = s.ghostSubdivs.reduce((a, b) => a + b, 0);
+        const ghostBlock = {
+          x: s.ghostX,
+          width: s.ghostWidth,
+          subdivs: s.ghostSubdivs,
+          key: totalSixteenths / 2,
+          struck: [],
+        };
+        drawBlock(ctx, ghostBlock, true, s.ghostDropY);
+      }
+
+      // ── Sparks ──
+      s.sparks.forEach(sp => {
+        ctx.globalAlpha = sp.life;
+        ctx.fillStyle = sp.color;
+        ctx.beginPath(); ctx.arc(sp.x, sp.y, sp.size, 0, Math.PI * 2); ctx.fill();
+      });
+      ctx.globalAlpha = 1;
+
+      // ── Key prompt panel (bottom left) ──
+      if ((s.phase === "playing") && s.windowOpen && s.ghostSubdivs) {
+        const needed = s.ghostSubdivs.reduce((a, b) => a + b, 0) / 2;
+        // Urgency: fraction of travel from spawn (W) to deadline (MALLET_X) already consumed
+        const totalTravel = W - MALLET_X;
+        const remaining = Math.max(0, s.ghostX - MALLET_X);
+        const urgency = 1 - Math.min(1, remaining / totalTravel);
+        const pulse = 0.75 + 0.25 * Math.sin(s.frameCount * (0.08 + urgency * 0.15));
+        const r = Math.floor(255);
+        const g = Math.floor(220 * (1 - urgency));
+        const panelX = 12, panelY = H - 96, panelW = 150, panelH = 84;
+        ctx.fillStyle = "rgba(8,8,16,0.92)";
+        ctx.fillRect(panelX, panelY, panelW, panelH);
+        ctx.strokeStyle = `rgba(${r},${g},0,${0.5 + urgency * 0.45})`;
+        ctx.lineWidth = 2;
+        ctx.strokeRect(panelX, panelY, panelW, panelH);
+        ctx.fillStyle = "#555566";
+        ctx.font = "9px 'Courier New', monospace";
+        ctx.textAlign = "left";
+        ctx.fillText("PRESS KEY:", panelX + 12, panelY + 18);
+        ctx.fillStyle = `rgba(${r},${g},0,${pulse})`;
+        ctx.font = `bold ${Math.floor(36 + urgency * 8)}px 'Courier New', monospace`;
+        ctx.textAlign = "center";
+        ctx.fillText(`[ ${needed} ]`, panelX + panelW / 2, panelY + 64);
+      }
+
+      // ── HUD ──
+      // Top-right score panel
+      const hudX = W - 200, hudY = 12;
+      ctx.fillStyle = "rgba(8,8,16,0.88)";
+      ctx.fillRect(hudX, hudY, 188, 72);
+      ctx.strokeStyle = "rgba(255,140,0,0.45)";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(hudX, hudY, 188, 72);
+      ctx.fillStyle = "#FF8C00";
+      ctx.font = "bold 10px 'Courier New', monospace";
+      ctx.textAlign = "left";
+      ctx.fillText(LEVEL_1.name, hudX + 10, hudY + 16);
+      ctx.fillStyle = "#777788";
+      ctx.font = "9px 'Courier New', monospace";
+      ctx.fillText(`BLOCK ${Math.min(s.seqIdx + 1, LEVEL_1.blocks.length)} / ${LEVEL_1.blocks.length}`, hudX + 10, hudY + 30);
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "bold 22px 'Courier New', monospace";
+      ctx.textAlign = "left";
+      ctx.fillText(String(s.score).padStart(5, "0"), hudX + 10, hudY + 58);
+      ctx.fillStyle = "rgba(255,140,0,0.55)";
+      ctx.font = "9px 'Courier New', monospace";
+      ctx.fillText(`HI:${String(s.highScore).padStart(5,"0")}`, hudX + 110, hudY + 58);
+
+      // ── Idle screen ──
+      if (s.phase === "idle") {
+        ctx.fillStyle = "rgba(8,8,16,0.93)";
+        ctx.fillRect(W/2-200, H/2-100, 400, 200);
+        ctx.strokeStyle = "rgba(255,140,0,0.65)";
+        ctx.lineWidth = 2;
+        ctx.strokeRect(W/2-200, H/2-100, 400, 200);
+        ctx.fillStyle = "#FF8C00";
+        ctx.font = "bold 26px 'Courier New', monospace";
+        ctx.textAlign = "center";
+        ctx.fillText("M A R R O W", W/2, H/2-60);
+        ctx.fillStyle = "#666677";
+        ctx.font = "10px 'Courier New', monospace";
+        ctx.fillText("MESHUGGAH — KOLOSS, 2012", W/2, H/2-38);
+        ctx.fillStyle = "#9999aa";
+        ctx.font = "11px 'Courier New', monospace";
+        ctx.fillText("WHEN GHOST BLOCK APPEARS, PRESS ITS SIZE", W/2, H/2-10);
+        ctx.fillText("[ 3 ] · [ 4 ] · [ 5 ]  —  EIGHTHS", W/2, H/2+12);
+        ctx.fillText("WRONG KEY OR SLOW = SYSTEM FAILURE", W/2, H/2+34);
+        ctx.fillStyle = "#FF8C00";
+        ctx.font = "bold 13px 'Courier New', monospace";
+        ctx.fillText("[ ENTER ] TO BEGIN", W/2, H/2+68);
+      }
+
+      // ── Game over ──
+      if (s.phase === "gameover") {
+        ctx.fillStyle = "rgba(6,2,2,0.95)";
+        ctx.fillRect(W/2-210, H/2-115, 420, 230);
+        ctx.strokeStyle = "#aa1100";
+        ctx.lineWidth = 3;
+        ctx.strokeRect(W/2-210, H/2-115, 420, 230);
+        ctx.fillStyle = "#cc1100";
+        ctx.font = "bold 30px 'Courier New', monospace";
+        ctx.textAlign = "center";
+        ctx.fillText("SYSTEM FAILURE", W/2, H/2-72);
+        ctx.fillStyle = "rgba(200,60,40,0.9)";
+        ctx.font = "10px 'Courier New', monospace";
+        ctx.fillText(s.gameOverReason, W/2, H/2-46);
+        ctx.strokeStyle = "rgba(150,30,20,0.4)";
+        ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(W/2-180, H/2-30); ctx.lineTo(W/2+180, H/2-30); ctx.stroke();
+        ctx.fillStyle = "#ffffff";
+        ctx.font = "bold 36px 'Courier New', monospace";
+        ctx.fillText(String(s.score).padStart(5,"0"), W/2, H/2+12);
+        ctx.fillStyle = "#555566";
+        ctx.font = "9px 'Courier New', monospace";
+        ctx.fillText("SCORE", W/2, H/2+28);
+        ctx.fillStyle = "rgba(255,140,0,0.7)";
+        ctx.font = "10px 'Courier New', monospace";
+        ctx.fillText(`HIGH SCORE: ${String(s.highScore).padStart(5,"0")}`, W/2, H/2+52);
+        ctx.fillStyle = "#FF8C00";
+        ctx.font = "bold 12px 'Courier New', monospace";
+        ctx.fillText("[ ENTER ] TO RETRY", W/2, H/2+84);
+      }
+
+      // ── Win ──
+      if (s.phase === "win") {
+        const pulse = 0.7 + 0.3 * Math.sin(s.frameCount * 0.06);
+        ctx.fillStyle = "rgba(2,6,2,0.95)";
+        ctx.fillRect(W/2-210, H/2-115, 420, 230);
+        ctx.strokeStyle = `rgba(80,220,80,${pulse})`;
+        ctx.lineWidth = 3;
+        ctx.strokeRect(W/2-210, H/2-115, 420, 230);
+        ctx.fillStyle = `rgba(80,220,80,${pulse})`;
+        ctx.font = "bold 26px 'Courier New', monospace";
+        ctx.textAlign = "center";
+        ctx.fillText("LEVEL COMPLETE", W/2, H/2-68);
+        ctx.fillStyle = "#aaffaa";
+        ctx.font = "10px 'Courier New', monospace";
+        ctx.fillText("MARROW — LEVEL I", W/2, H/2-44);
+        ctx.strokeStyle = "rgba(80,180,80,0.35)";
+        ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(W/2-180, H/2-28); ctx.lineTo(W/2+180, H/2-28); ctx.stroke();
+        ctx.fillStyle = "#ffffff";
+        ctx.font = "bold 36px 'Courier New', monospace";
+        ctx.fillText(String(s.score).padStart(5,"0"), W/2, H/2+14);
+        ctx.fillStyle = "#557755";
+        ctx.font = "9px 'Courier New', monospace";
+        ctx.fillText("FINAL SCORE", W/2, H/2+30);
+        ctx.fillStyle = "rgba(80,220,80,0.75)";
+        ctx.font = "bold 12px 'Courier New', monospace";
+        ctx.fillText("[ ENTER ] TO PLAY AGAIN", W/2, H/2+76);
+      }
+
+      ctx.restore();
+      rafRef.current = requestAnimationFrame(loop);
+    }
+
+    rafRef.current = requestAnimationFrame(loop);
+    return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current); };
+  }, [triggerGameOver, spawnGhost, syncUI]);
+
+  return (
+    <div style={{
+      background: "#05050c",
+      minHeight: "100vh",
+      display: "flex",
+      flexDirection: "column",
+      alignItems: "center",
+      justifyContent: "center",
+      userSelect: "none",
+      fontFamily: "'Courier New', monospace",
+    }}>
+      <div style={{ color: "rgba(255,140,0,0.5)", fontSize: 10, letterSpacing: 5, marginBottom: 10 }}>
+        KOLOSS · 2012 · TRACK VI
+      </div>
+      <canvas
+        ref={canvasRef}
+        width={W}
+        height={H}
+        style={{
+          display: "block",
+          border: "1px solid rgba(255,140,0,0.25)",
+          boxShadow: "0 0 60px rgba(255,80,0,0.12), 0 0 120px rgba(255,80,0,0.06)",
+        }}
+      />
+      <div style={{
+        marginTop: 10,
+        color: "rgba(100,100,120,0.7)",
+        fontSize: 10,
+        letterSpacing: 3,
+      }}>
+        [ 3 ] 3/8 · [ 4 ] 4/8 · [ 5 ] 5/8 · [ ENTER ] START
+      </div>
+    </div>
+  );
+}
